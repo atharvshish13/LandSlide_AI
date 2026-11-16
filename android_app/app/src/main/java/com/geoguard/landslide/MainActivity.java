@@ -714,9 +714,11 @@ public class MainActivity extends AppCompatActivity implements NativeDashboardVi
     @Override
     public void savePdf(String report) {
         pendingReportText = report;
-        String fileName = report.contains("AI HISTORICAL ANALYSIS")
-                ? "drishti-setu-ai-history-analysis.pdf"
-                : "drishti-setu-sensor-report.pdf";
+        String fileName = report.contains("PRIVATE MEDICAL HISTORY")
+                ? "drishti-setu-medical-history.pdf"
+                : report.contains("AI HISTORICAL ANALYSIS")
+                        ? "drishti-setu-ai-history-analysis.pdf"
+                        : "drishti-setu-sensor-report.pdf";
         pdfExportLauncher.launch(fileName);
     }
 
@@ -1048,7 +1050,18 @@ public class MainActivity extends AppCompatActivity implements NativeDashboardVi
                 Paint header = new Paint(Paint.ANTI_ALIAS_FLAG);
                 header.setColor(Color.rgb(8, 126, 131));
                 header.setTextSize(9);
-                page.getCanvas().drawText("DRISHTI SETU  |  SENSOR SAFETY REPORT", margin, 28, header);
+                boolean medicalReport = report.contains("PRIVATE MEDICAL HISTORY");
+                String heading = medicalReport ? "DRISHTI SETU  |  PRIVATE MEDICAL HISTORY"
+                        : report.contains("AI HISTORICAL ANALYSIS")
+                                ? "DRISHTI SETU  |  AI SENSOR HISTORY"
+                                : "DRISHTI SETU  |  SENSOR SAFETY REPORT";
+                android.graphics.drawable.Drawable logo =
+                        ContextCompat.getDrawable(this, R.drawable.drishti_launcher);
+                if (logo != null) {
+                    logo.setBounds(margin, 8, margin + 24, 32);
+                    logo.draw(page.getCanvas());
+                }
+                page.getCanvas().drawText(heading, margin + 32, 24, header);
                 int y = 52;
                 while (index < lines.size() && y < height - margin) {
                     page.getCanvas().drawText(lines.get(index++), margin, y, body);

@@ -583,7 +583,7 @@ final class NativeDashboardView extends LinearLayout {
         return telemetry;
     }
 
-    private void generateHistoryAnalysis() {
+    private void generateHistoryAnalysis(boolean downloadPdf) {
         if (reportAnalysisLoading) return;
         if (history.length() == 0) {
             Toast.makeText(getContext(), "No saved sensor readings are available to analyze.", Toast.LENGTH_LONG).show();
@@ -611,6 +611,10 @@ final class NativeDashboardView extends LinearLayout {
                 reportAnalysis = error == null ? response : "";
                 reportAnalysisError = error == null ? "" : error;
                 if ("reports".equals(screen)) renderReports();
+                if (downloadPdf && error == null) {
+                    actions.savePdf(buildReport() + "\n\nAI HISTORICAL ANALYSIS\n\n" + response
+                            + "\n\nGenerated with Gemini from up to 20 recent saved readings.");
+                }
             });
         } catch (JSONException error) {
             reportAnalysisLoading = false;
@@ -648,8 +652,14 @@ final class NativeDashboardView extends LinearLayout {
         analysis.addView(text("Analyze up to 20 recent saved readings using Gemini. The report includes observed trends and data-quality limits.", 13, MUTED, false));
         Button analyze = button(getContext(), reportAnalysisLoading ? "Analyzing…" : "Analyze sensor history", TEAL, 0xffffffff);
         analyze.setEnabled(!reportAnalysisLoading);
-        analyze.setOnClickListener(view -> generateHistoryAnalysis());
+        analyze.setOnClickListener(view -> generateHistoryAnalysis(false));
         addButton(analysis, analyze);
+        Button downloadAnalysis = button(getContext(),
+                reportAnalysisLoading ? "Preparing fresh AI report…" : "Generate fresh AI report and download PDF",
+                0xffe8f4f3, TEAL);
+        downloadAnalysis.setEnabled(!reportAnalysisLoading);
+        downloadAnalysis.setOnClickListener(view -> generateHistoryAnalysis(true));
+        addButton(analysis, downloadAnalysis);
         if (reportAnalysisLoading) {
             analysis.addView(text("Preparing the historical analysis…", 13, MUTED, false));
         } else if (!reportAnalysisError.isEmpty()) {
@@ -658,11 +668,6 @@ final class NativeDashboardView extends LinearLayout {
             TextView result = text(reportAnalysis, 13, INK, false);
             result.setPadding(0, dp(10), 0, dp(8));
             analysis.addView(result);
-            Button saveAnalysis = button(getContext(), "Download AI analysis as PDF", 0xffe8f4f3, TEAL);
-            saveAnalysis.setOnClickListener(view -> actions.savePdf(
-                    buildReport() + "\n\nAI HISTORICAL ANALYSIS\n\n" + reportAnalysis
-                            + "\n\nGenerated with Gemini from up to 20 recent saved readings."));
-            addButton(analysis, saveAnalysis);
         }
         content.addView(analysis);
         Button whatsapp = button(getContext(), "Configure alert delivery", SURFACE, INK);
@@ -685,6 +690,15 @@ final class NativeDashboardView extends LinearLayout {
                 .append("Samples in local history: ").append(history.length()).append('\n')
                 .append("\nSensor screening is not a geotechnical assessment. Follow local emergency guidance.");
         return report.toString();
+    }
+
+    private String buildMedicalReport() {
+        return "DRISHTI SETU — PRIVATE MEDICAL HISTORY\n"
+                + "Generated: " + DateFormat.getDateTimeInstance().format(new Date()) + '\n'
+                + "Patient: User\n\n"
+                + medicalSummary
+                + "\n\nThis document contains private health information. Store and share it carefully. "
+                + "It is a user-provided emergency reference, not a medical diagnosis.";
     }
 
     private String buildCsv() {
@@ -833,6 +847,9 @@ final class NativeDashboardView extends LinearLayout {
         Button edit = button(getContext(), "Edit medical history", TEAL, 0xffffffff);
         edit.setOnClickListener(view -> actions.editMedicalHistory());
         addButton(content, edit);
+        Button download = button(getContext(), "Download medical history as PDF", 0xffe8f4f3, TEAL);
+        download.setOnClickListener(view -> actions.savePdf(buildMedicalReport()));
+        addButton(content, download);
         content.addView(text("Find nearby services", 17, INK, true));
         content.addView(text("These buttons open a map search. The app cannot identify or automatically message nearby hospitals or police without a verified emergency-service directory.", 12, MUTED, false));
         Button hospitals = button(getContext(), "Find nearby hospitals", 0xffe6f4f8, TEAL);
