@@ -9,6 +9,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.speech.RecognizerIntent;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.pdf.PdfDocument;
@@ -20,6 +21,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.telephony.SmsManager;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
@@ -27,8 +29,10 @@ import android.text.InputType;
 import android.util.Base64;
 import android.view.ViewGroup;
 import android.widget.EditText;
+import android.widget.CheckBox;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.activity.result.ActivityResultLauncher;
@@ -69,9 +73,11 @@ import javax.crypto.spec.GCMParameterSpec;
 public class MainActivity extends AppCompatActivity implements NativeDashboardView.Actions {
     private static final int PERMISSION_REQUEST_CODE = 2001;
     private static final int SOS_SMS_PERMISSION_REQUEST_CODE = 2002;
+    private static final int VOICE_PERMISSION_REQUEST_CODE = 2003;
     private static final String ALERT_CHANNEL_ID = "landslide_alerts_channel";
     private static final String SETTINGS_PREFS = "geoguard_secure_settings";
     private static final String SETTINGS_KEY = "provider_settings";
+    private static final String MEDICAL_SETTINGS_KEY = "medical_profile";
     private static final String KEYSTORE_ALIAS = "GeoGuardProviderSettings";
     private static final String RUNTIME_PREFS = "geoguard_runtime";
     private static final String BACKEND_PORT_KEY = "backend_port";
@@ -82,6 +88,7 @@ public class MainActivity extends AppCompatActivity implements NativeDashboardVi
     private NativeDashboardView dashboard;
     private ActivityResultLauncher<String> pdfExportLauncher;
     private ActivityResultLauncher<String> csvExportLauncher;
+    private ActivityResultLauncher<Intent> voiceInputLauncher;
     private String pendingReportText = "";
     private String pendingCsvText = "";
     private volatile String backendUrl = "";
@@ -95,6 +102,7 @@ public class MainActivity extends AppCompatActivity implements NativeDashboardVi
     private boolean smsPermissionPending;
     private String pendingSosRecipient = "";
     private String pendingSosMessage = "";
+    private String pendingSosMedicalContext = "";
     private String pendingSosRisk = "";
     private String pendingSosProviderSettings = "";
     private double pendingSosLatitude = Double.NaN;
@@ -118,7 +126,16 @@ public class MainActivity extends AppCompatActivity implements NativeDashboardVi
         csvExportLauncher = registerForActivityResult(
                 new ActivityResultContracts.CreateDocument("text/csv"),
                 uri -> { if (uri != null) writeCsv(uri, pendingCsvText); });
+        voiceInputLauncher = registerForActivityResult(
+                new ActivityResultContracts.StartActivityForResult(),
+                result -> {
+                    if (result.getResultCode() != RESULT_OK || result.getData() == null) return;
+                    ArrayList<String> matches = result.getData()
+                            .getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
+                    if (matches != null && !matches.isEmpty()) dashboard.setVoiceInput(matches.get(0));
+                });
         dashboard = new NativeDashboardView(this, this);
+        refreshMedicalSummary();
         setContentView(dashboard);
         createNotificationChannel();
         startEmbeddedBackend();
@@ -282,6 +299,81 @@ public class MainActivity extends AppCompatActivity implements NativeDashboardVi
     @Override
     public void requestPermissions() {
         requestRequiredPermissions();
+        if (hasLocationPermission() && !isLocationProviderEnabled()) {
+            new AlertDialog.Builder(this)
+                    .setTitle("Turn on device location")
+                    .setMessage("Phone location is the fallback when the ESP32 GPS has no fix. Enable Location on your device to use the fallback.")
+                    .setNegativeButton("Not now", null)
+                    .setPositiveButton("Open location settings", (dialog, which) -> {
+                        try {
+                            startActivity(new Intent(android.provider.Settings.ACTION_LOCATION_SOURCE_SETTINGS));
+                        } catch (android.content.ActivityNotFoundException error) {
+                            Toast.makeText(this, "Could not open device location settings.",
+                                    Toast.LENGTH_LONG).show();
+                        }
+                    })
+                    .show();
+        }
+    }
+
+    private boolean isLocationProviderEnabled() {
+        LocationManager manager = (LocationManager) getSystemService(LOCATION_SERVICE);
+        if (manager == null) return false;
+        try {
+            return manager.isProviderEnabled(LocationManager.GPS_PROVIDER)
+                    || manager.isProviderEnabled(LocationManager.NETWORK_PROVIDER);
+        } catch (IllegalArgumentException error) {
+            android.util.Log.w("DrishtiSetu", "Device location providers are unavailable.", error);
+            return false;
+        }
+    }
+
+    @Override
+    public void openVoiceInput() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.RECORD_AUDIO}, VOICE_PERMISSION_REQUEST_CODE);
+            return;
+        }
+        launchVoiceRecognition();
+    }
+
+    @Override
+    public void editMedicalHistory() {
+        showMedicalHistoryEditor();
+    }
+
+    @Override
+    public void openNearbyFacilities(String facility, double latitude, double longitude) {
+        double[] coordinates = resolveCoordinates(latitude, longitude);
+        if (coordinates == null) return;
+        String query = Uri.encode(facility + " near "
+                + String.format(Locale.US, "%.6f,%.6f", coordinates[0], coordinates[1]));
+        Uri uri = Uri.parse("https://www.google.com/maps/search/?api=1&query=" + query);
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, uri));
+        } catch (android.content.ActivityNotFoundException error) {
+            Toast.makeText(this, "Could not open a map search. Check that a browser or Maps app is installed.",
+                    Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void launchVoiceRecognition() {
+        if (!getPackageManager().hasSystemFeature(PackageManager.FEATURE_MICROPHONE)) {
+            Toast.makeText(this, "This device has no microphone.", Toast.LENGTH_LONG).show();
+            return;
+        }
+        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        intent.putExtra(RecognizerIntent.EXTRA_PROMPT, "Ask about your sensor readings");
+        intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
+        try {
+            voiceInputLauncher.launch(intent);
+        } catch (android.content.ActivityNotFoundException error) {
+            Toast.makeText(this, "No speech recognition service is available on this device.",
+                    Toast.LENGTH_LONG).show();
+        }
     }
 
     private boolean hasLocationPermission() {
@@ -294,6 +386,10 @@ public class MainActivity extends AppCompatActivity implements NativeDashboardVi
         if (!hasLocationPermission()) {
             requested.add(Manifest.permission.ACCESS_FINE_LOCATION);
             requested.add(Manifest.permission.ACCESS_COARSE_LOCATION);
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            requested.add(Manifest.permission.RECORD_AUDIO);
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
                 && ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
@@ -318,13 +414,24 @@ public class MainActivity extends AppCompatActivity implements NativeDashboardVi
                 Toast.makeText(this, "SMS permission was denied. WhatsApp SOS will continue.", Toast.LENGTH_LONG).show();
             }
             continueWhatsAppSos(pendingSosRecipient, pendingSosMessage, pendingSosRisk,
-                    pendingSosLatitude, pendingSosLongitude, pendingSosProviderSettings);
+                    pendingSosLatitude, pendingSosLongitude, pendingSosProviderSettings,
+                    pendingSosMedicalContext);
             finishSosIfComplete();
+            return;
+        }
+        if (requestCode == VOICE_PERMISSION_REQUEST_CODE) {
+            if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) {
+                launchVoiceRecognition();
+            } else {
+                Toast.makeText(this, "Microphone permission is needed for voice questions. You can still type.",
+                        Toast.LENGTH_LONG).show();
+            }
             return;
         }
         if (requestCode != PERMISSION_REQUEST_CODE) return;
         if (hasLocationPermission()) startLocationUpdates();
-        else Toast.makeText(this, "Location permission is off. Sensor readings still work; phone GPS is unavailable.", Toast.LENGTH_LONG).show();
+        else Toast.makeText(this, "Location permission is off. Phone GPS fallback is unavailable.",
+                Toast.LENGTH_LONG).show();
     }
 
     private void startLocationUpdates() {
@@ -335,7 +442,8 @@ public class MainActivity extends AppCompatActivity implements NativeDashboardVi
             locationListener = new LocationListener() {
                 @Override public void onLocationChanged(@NonNull Location location) {
                     lastPhoneLocation = location;
-                    dashboard.setLocation(location.getLatitude(), location.getLongitude(), location.getAccuracy());
+                    dashboard.setPhoneLocation(location.getLatitude(), location.getLongitude(),
+                            location.getAccuracy(), location.getElapsedRealtimeNanos());
                 }
                 @Override public void onProviderDisabled(@NonNull String provider) {}
             };
@@ -347,7 +455,7 @@ public class MainActivity extends AppCompatActivity implements NativeDashboardVi
             if (fineLocation && locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
                 locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 10000L, 10f, locationListener);
                 Location last = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER);
-                if (last != null) locationListener.onLocationChanged(last);
+                if (isRecentLocation(last)) locationListener.onLocationChanged(last);
                 started = true;
             }
             if (locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
@@ -378,7 +486,8 @@ public class MainActivity extends AppCompatActivity implements NativeDashboardVi
             Toast.makeText(this, "SOS is already being sent.", Toast.LENGTH_SHORT).show();
             return;
         }
-        if ((!Double.isFinite(latitude) || !Double.isFinite(longitude)) && lastPhoneLocation != null) {
+        if ((!Double.isFinite(latitude) || !Double.isFinite(longitude))
+                && isRecentLocation(lastPhoneLocation)) {
             latitude = lastPhoneLocation.getLatitude();
             longitude = lastPhoneLocation.getLongitude();
         }
@@ -401,14 +510,25 @@ public class MainActivity extends AppCompatActivity implements NativeDashboardVi
 
         String coordinates = Double.isFinite(latitude) && Double.isFinite(longitude)
                 ? String.format(Locale.US, "%.5f,%.5f", latitude, longitude) : "";
+        String medicalContext = "";
+        try {
+            medicalContext = medicalContextForSos(readMedicalProfile());
+        } catch (Exception error) {
+            android.util.Log.e("DrishtiSetu", "Could not read the encrypted medical card.", error);
+            Toast.makeText(this, "SOS will continue without medical details because the private card could not be read.",
+                    Toast.LENGTH_LONG).show();
+        }
+        final String approvedMedicalContext = medicalContext;
         String message = "Drishti Setu SOS: Emergency assistance requested. Status: " + risk
                 + (coordinates.isEmpty() ? ". Phone GPS location is unavailable."
-                : ". Location: " + coordinates + " https://maps.google.com/?q=" + coordinates);
+                : ". Location: " + coordinates + " https://maps.google.com/?q=" + coordinates)
+                + approvedMedicalContext;
 
         sosSending = true;
         whatsappSosComplete = false;
         pendingSosRecipient = recipient;
         pendingSosMessage = message;
+        pendingSosMedicalContext = approvedMedicalContext;
         pendingSosRisk = risk;
         pendingSosLatitude = latitude;
         pendingSosLongitude = longitude;
@@ -421,7 +541,8 @@ public class MainActivity extends AppCompatActivity implements NativeDashboardVi
             return;
         }
         sendSmsNow(recipient, message);
-        continueWhatsAppSos(recipient, message, risk, latitude, longitude, providerSettings);
+        continueWhatsAppSos(recipient, message, risk, latitude, longitude, providerSettings,
+                approvedMedicalContext);
         finishSosIfComplete();
     }
 
@@ -433,7 +554,8 @@ public class MainActivity extends AppCompatActivity implements NativeDashboardVi
     }
 
     private void continueWhatsAppSos(String recipient, String message, String risk,
-                                      double latitude, double longitude, String providerSettings) {
+                                      double latitude, double longitude, String providerSettings,
+                                      String medicalContext) {
         JSONObject settings;
         try {
             settings = new JSONObject(providerSettings.isEmpty() ? "{}" : providerSettings);
@@ -461,6 +583,7 @@ public class MainActivity extends AppCompatActivity implements NativeDashboardVi
                     payload.put("latitude", latitude);
                     payload.put("longitude", longitude);
                 }
+                if (!medicalContext.isEmpty()) payload.put("medical_context", medicalContext);
                 HttpURLConnectionWithBody response = request(backendUrl + "/api/alerts/sos", "POST", payload, 10000);
                 if (response.status != 202) {
                     JSONObject errorBody = new JSONObject(response.body);
@@ -523,6 +646,7 @@ public class MainActivity extends AppCompatActivity implements NativeDashboardVi
             sosSending = false;
             pendingSosRecipient = "";
             pendingSosMessage = "";
+            pendingSosMedicalContext = "";
             pendingSosRisk = "";
             pendingSosProviderSettings = "";
             pendingSosLatitude = Double.NaN;
@@ -532,22 +656,54 @@ public class MainActivity extends AppCompatActivity implements NativeDashboardVi
 
     @Override
     public void openMap(double latitude, double longitude) {
-        if ((!Double.isFinite(latitude) || !Double.isFinite(longitude)) && lastPhoneLocation != null) {
-            latitude = lastPhoneLocation.getLatitude();
-            longitude = lastPhoneLocation.getLongitude();
-        }
-        if (!Double.isFinite(latitude) || !Double.isFinite(longitude)) {
-            Toast.makeText(this, "No confirmed GPS fix is available yet.", Toast.LENGTH_LONG).show();
-            requestRequiredPermissions();
-            return;
-        }
-        Uri uri = Uri.parse(String.format(Locale.US, "geo:%f,%f?q=%f,%f",
-                latitude, longitude, latitude, longitude));
+        double[] coordinates = resolveCoordinates(latitude, longitude);
+        if (coordinates == null) return;
+        Uri uri = Uri.parse(String.format(Locale.US,
+                "https://www.google.com/maps/@?api=1&map_action=map&center=%.6f,%.6f&zoom=19&basemap=satellite&tilt=45",
+                coordinates[0], coordinates[1]));
         try {
             startActivity(new Intent(Intent.ACTION_VIEW, uri));
         } catch (android.content.ActivityNotFoundException error) {
-            Toast.makeText(this, "No map app is installed.", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "Could not open a satellite map. Check that a browser or Maps app is installed.",
+                    Toast.LENGTH_LONG).show();
         }
+    }
+
+    @Override
+    public void openEarth(double latitude, double longitude) {
+        double[] coordinates = resolveCoordinates(latitude, longitude);
+        if (coordinates == null) return;
+        Uri uri = Uri.parse(String.format(Locale.US,
+                "https://earth.google.com/web/@%.6f,%.6f,2000a,0d,45y,0h,0t,0r",
+                coordinates[0], coordinates[1]));
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, uri));
+        } catch (android.content.ActivityNotFoundException error) {
+            Toast.makeText(this, "Could not open Google Earth. Check that a browser is installed.",
+                    Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private double[] resolveCoordinates(double latitude, double longitude) {
+        if ((!Double.isFinite(latitude) || !Double.isFinite(longitude))
+                && isRecentLocation(lastPhoneLocation)) {
+            latitude = lastPhoneLocation.getLatitude();
+            longitude = lastPhoneLocation.getLongitude();
+        }
+        if (Double.isFinite(latitude) && Double.isFinite(longitude)
+                && Math.abs(latitude) <= 90 && Math.abs(longitude) <= 180) {
+            return new double[]{latitude, longitude};
+        }
+        Toast.makeText(this, "Waiting for a phone or ESP32 GPS fix. Enable Location and try again.",
+                Toast.LENGTH_LONG).show();
+        requestRequiredPermissions();
+        return null;
+    }
+
+    private boolean isRecentLocation(Location location) {
+        if (location == null) return false;
+        long ageNanos = SystemClock.elapsedRealtimeNanos() - location.getElapsedRealtimeNanos();
+        return ageNanos >= 0 && ageNanos <= 2L * 60L * 1_000_000_000L;
     }
 
     @Override
@@ -592,6 +748,143 @@ public class MainActivity extends AppCompatActivity implements NativeDashboardVi
                 runOnUiThread(() -> callback.onResult(null, message));
             }
         });
+    }
+
+    private JSONObject readMedicalProfile() throws Exception {
+        String plaintext = readEncryptedValue(this, MEDICAL_SETTINGS_KEY);
+        return plaintext.isEmpty() ? new JSONObject() : new JSONObject(plaintext);
+    }
+
+    private void refreshMedicalSummary() {
+        try {
+            JSONObject profile = readMedicalProfile();
+            dashboard.setMedicalSummary(formatMedicalSummary(profile),
+                    profile.optBoolean("share_medical_on_sos", false));
+        } catch (Exception error) {
+            android.util.Log.e("DrishtiSetu", "Could not read the encrypted medical card.", error);
+            Toast.makeText(this, "Saved medical history could not be decrypted.", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private String formatMedicalSummary(JSONObject profile) {
+        StringBuilder summary = new StringBuilder();
+        appendMedicalField(summary, "Blood group", profile.optString("blood_group", ""));
+        appendMedicalField(summary, "Allergies", profile.optString("allergies", ""));
+        appendMedicalField(summary, "Conditions", profile.optString("medical_conditions", ""));
+        appendMedicalField(summary, "Medications", profile.optString("medications", ""));
+        appendMedicalField(summary, "Emergency notes", profile.optString("emergency_notes", ""));
+        return summary.length() == 0 ? "No medical history saved." : summary.toString().trim();
+    }
+
+    private String medicalContextForSos(JSONObject profile) {
+        if (!profile.optBoolean("share_medical_on_sos", false)) return "";
+        String summary = formatMedicalSummary(profile);
+        if ("No medical history saved.".equals(summary)) return "";
+        String flattened = summary.replace('\n', ';').trim();
+        if (flattened.length() > 650) flattened = flattened.substring(0, 650);
+        return " User-approved medical card: " + flattened;
+    }
+
+    private void appendMedicalField(StringBuilder summary, String label, String value) {
+        String normalized = value == null ? "" : value.trim().replaceAll("\\s+", " ");
+        if (normalized.isEmpty()) return;
+        if (summary.length() > 0) summary.append('\n');
+        summary.append(label).append(": ").append(normalized);
+    }
+
+    private void showMedicalHistoryEditor() {
+        final JSONObject saved;
+        try {
+            saved = readMedicalProfile();
+        } catch (Exception error) {
+            android.util.Log.e("DrishtiSetu", "Could not open the encrypted medical card.", error);
+            Toast.makeText(this, "Medical history could not be opened.", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        LinearLayout fields = new LinearLayout(this);
+        fields.setOrientation(LinearLayout.VERTICAL);
+        int padding = Math.round(20 * getResources().getDisplayMetrics().density);
+        fields.setPadding(padding, 8, padding, 8);
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(fields);
+        EditText bloodGroup = addMedicalField(fields, "Blood group (optional)",
+                saved.optString("blood_group", ""), 40);
+        EditText allergies = addMedicalField(fields, "Allergies (optional)",
+                saved.optString("allergies", ""), 160);
+        EditText conditions = addMedicalField(fields, "Medical conditions (optional)",
+                saved.optString("medical_conditions", ""), 160);
+        EditText medications = addMedicalField(fields, "Medications (optional)",
+                saved.optString("medications", ""), 160);
+        EditText emergencyNotes = addMedicalField(fields, "Emergency notes (optional)",
+                saved.optString("emergency_notes", ""), 220);
+        CheckBox share = new CheckBox(this);
+        share.setText("Include these medical details in SOS SMS and WhatsApp messages to my configured contact");
+        share.setTextSize(14);
+        share.setChecked(saved.optBoolean("share_medical_on_sos", false));
+        fields.addView(share, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        TextView privacy = new TextView(this);
+        privacy.setText("The card is encrypted on this phone. Details are excluded from SOS by default. If opted in, they are sent only to your configured recipient. Nearby hospital and police searches open Maps; they do not send your medical record or contact those services.");
+        privacy.setTextSize(12);
+        fields.addView(privacy, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("Private emergency medical card")
+                .setView(scroll)
+                .setNegativeButton("Cancel", null)
+                .setNeutralButton("Clear", null)
+                .setPositiveButton("Save", null)
+                .create();
+        dialog.setOnShowListener(ignored -> {
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(view -> {
+                bloodGroup.setText("");
+                allergies.setText("");
+                conditions.setText("");
+                medications.setText("");
+                emergencyNotes.setText("");
+                share.setChecked(false);
+            });
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+                JSONObject profile = new JSONObject();
+                try {
+                    profile.put("blood_group", fieldValue(bloodGroup));
+                    profile.put("allergies", fieldValue(allergies));
+                    profile.put("medical_conditions", fieldValue(conditions));
+                    profile.put("medications", fieldValue(medications));
+                    profile.put("emergency_notes", fieldValue(emergencyNotes));
+                    profile.put("share_medical_on_sos", share.isChecked());
+                    writeEncryptedValue(MEDICAL_SETTINGS_KEY, profile.toString());
+                    dashboard.setMedicalSummary(formatMedicalSummary(profile), share.isChecked());
+                    Toast.makeText(this, "Medical card encrypted and saved on this device.",
+                            Toast.LENGTH_LONG).show();
+                    dialog.dismiss();
+                } catch (Exception error) {
+                    android.util.Log.e("DrishtiSetu", "Could not save the encrypted medical card.", error);
+                    Toast.makeText(this, "Medical card could not be encrypted or saved.",
+                            Toast.LENGTH_LONG).show();
+                }
+            });
+        });
+        dialog.show();
+    }
+
+    private EditText addMedicalField(LinearLayout parent, String hint, String value, int maxLength) {
+        EditText field = new EditText(this);
+        field.setHint(hint);
+        field.setText(value);
+        field.setTextSize(14);
+        field.setSingleLine(false);
+        field.setMinLines(1);
+        field.setMaxLines(3);
+        field.setGravity(android.view.Gravity.TOP | android.view.Gravity.START);
+        field.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+                | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+        field.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(maxLength)});
+        parent.addView(field, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        return field;
     }
 
     private void showProviderSettings() {
@@ -694,6 +987,10 @@ public class MainActivity extends AppCompatActivity implements NativeDashboardVi
     }
 
     private void writeEncryptedSettings(String plaintext) throws Exception {
+        writeEncryptedValue(SETTINGS_KEY, plaintext);
+    }
+
+    private void writeEncryptedValue(String preferenceKey, String plaintext) throws Exception {
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.ENCRYPT_MODE, getOrCreateSettingsKey(this));
         byte[] ciphertext = cipher.doFinal(plaintext.getBytes(StandardCharsets.UTF_8));
@@ -702,11 +999,16 @@ public class MainActivity extends AppCompatActivity implements NativeDashboardVi
         System.arraycopy(iv, 0, encoded, 0, iv.length);
         System.arraycopy(ciphertext, 0, encoded, iv.length, ciphertext.length);
         getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE).edit()
-                .putString(SETTINGS_KEY, Base64.encodeToString(encoded, Base64.NO_WRAP)).apply();
+                .putString(preferenceKey, Base64.encodeToString(encoded, Base64.NO_WRAP)).apply();
     }
 
     public static String readProviderSettings(Context context) throws Exception {
-        String stored = context.getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE).getString(SETTINGS_KEY, "");
+        return readEncryptedValue(context, SETTINGS_KEY);
+    }
+
+    private static String readEncryptedValue(Context context, String preferenceKey) throws Exception {
+        String stored = context.getSharedPreferences(SETTINGS_PREFS, MODE_PRIVATE)
+                .getString(preferenceKey, "");
         if (stored == null || stored.isEmpty()) return "";
         byte[] encoded = Base64.decode(stored, Base64.NO_WRAP);
         int ivLength = 12;

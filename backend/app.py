@@ -97,6 +97,11 @@ def send_sos_alert():
         return jsonify({'error': 'Risk level must be LOW, MEDIUM, HIGH, CRITICAL, UNKNOWN, or SOS.'}), 400
     risk_level = risk_level.strip().upper()
 
+    medical_context = data.get('medical_context', '')
+    if not isinstance(medical_context, str) or len(medical_context) > 720:
+        return jsonify({'error': 'Medical context must be text of at most 720 characters.'}), 400
+    medical_context = medical_context.strip()
+
     coordinates = ''
     if 'latitude' in data or 'longitude' in data:
         try:
@@ -128,6 +133,7 @@ def send_sos_alert():
     message = (
         f'SOS requested for {location_name}. Status: {risk_level}.{coordinates} '
         'A user activated emergency assistance in GeoGuard. Follow local emergency guidance.'
+        + (f' {medical_context}' if medical_context else '')
     )
     try:
         message_id = send_whatsapp_alert(risk_level, message)

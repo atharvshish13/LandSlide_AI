@@ -7,6 +7,7 @@ import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.os.SystemClock;
 import android.text.InputType;
 import android.text.InputFilter;
 import android.view.Gravity;
@@ -37,9 +38,13 @@ import java.util.Locale;
 final class NativeDashboardView extends LinearLayout {
     interface Actions {
         void requestPermissions();
+        void openVoiceInput();
         void openSettings();
+        void editMedicalHistory();
         void sendSos(double latitude, double longitude, String risk);
         void openMap(double latitude, double longitude);
+        void openEarth(double latitude, double longitude);
+        void openNearbyFacilities(String facility, double latitude, double longitude);
         void savePdf(String report);
         void saveCsv(String csv);
         void sendGemini(JSONObject request, ResultCallback callback);
@@ -77,6 +82,14 @@ final class NativeDashboardView extends LinearLayout {
     private String chartKey = "";
     private String locationText = "Location not available";
     private TextView visibleLocationLabel;
+    private TextView visibleGpsSourceLabel;
+    private EditText chatInput;
+    private String pendingVoiceText = "";
+    private String medicalSummary = "No medical history saved.";
+    private boolean shareMedicalWithSos;
+    private double phoneLatitude = Double.NaN;
+    private double phoneLongitude = Double.NaN;
+    private long phoneLocationElapsedNanos;
     private boolean telemetryAvailable;
     private boolean stale;
     private boolean demo;
@@ -143,6 +156,8 @@ final class NativeDashboardView extends LinearLayout {
         stale = staleData;
         demo = simulated;
         updateConnection();
+        if ("map".equals(screen) && visibleGpsSourceLabel != null)
+            visibleGpsSourceLabel.setText(gpsLocationText());
         redrawCurrentDataScreen();
     }
 
@@ -166,13 +181,34 @@ final class NativeDashboardView extends LinearLayout {
         scroll.post(() -> scroll.scrollTo(0, savedScrollY));
     }
 
-    void setLocation(double latitude, double longitude, float accuracy) {
+    void setPhoneLocation(double latitude, double longitude, float accuracy, long elapsedRealtimeNanos) {
         if (Double.isFinite(latitude) && Double.isFinite(longitude)
                 && Math.abs(latitude) <= 90 && Math.abs(longitude) <= 180) {
+            phoneLatitude = latitude;
+            phoneLongitude = longitude;
+            phoneLocationElapsedNanos = elapsedRealtimeNanos;
             locationText = String.format(Locale.US, "%.5f, %.5f  ·  ±%.0fm",
                     latitude, longitude, accuracy);
             if (visibleLocationLabel != null) visibleLocationLabel.setText(locationText);
+            if (visibleGpsSourceLabel != null) visibleGpsSourceLabel.setText(gpsLocationText());
         }
+    }
+
+    void setVoiceInput(String recognizedText) {
+        if (recognizedText == null || recognizedText.trim().isEmpty()) return;
+        pendingVoiceText = recognizedText.trim();
+        if (chatInput != null && "ai".equals(screen)) {
+            chatInput.setText(pendingVoiceText);
+            chatInput.setSelection(chatInput.length());
+            pendingVoiceText = "";
+        }
+    }
+
+    void setMedicalSummary(String summary, boolean shareWithSos) {
+        medicalSummary = summary == null || summary.trim().isEmpty()
+                ? "No medical history saved." : summary;
+        shareMedicalWithSos = shareWithSos;
+        if ("medical".equals(screen)) renderMedicalHistory();
     }
 
     boolean handleBack() {
@@ -213,6 +249,7 @@ final class NativeDashboardView extends LinearLayout {
             case "alerts": renderAlerts(); break;
             case "twin": renderTwin(); break;
             case "map": renderMap(); break;
+            case "medical": renderMedicalHistory(); break;
             case "settings": renderSettings(); break;
             case "more": renderMore(); break;
             default: renderHome(); break;
@@ -320,8 +357,7 @@ final class NativeDashboardView extends LinearLayout {
 
         section("Your location");
         LinearLayout location = card();
-        TextView gpsLabel = text(gpsLocationText(), 13, INK, false);
-        location.addView(gpsLabel);
+        addGpsSourceLabel(location);
         addLocationLabel(location);
         Button mapButton = button(getContext(), "Open map", 0xffe8f4f3, TEAL);
         mapButton.setOnClickListener(view -> actions.openMap(latitude(), longitude()));
@@ -382,7 +418,7 @@ final class NativeDashboardView extends LinearLayout {
 
         section("Sensor location");
         LinearLayout gps = card();
-        gps.addView(text(gpsLocationText(), 13, INK, false));
+        addGpsSourceLabel(gps);
         addLocationLabel(gps);
         Button request = button(getContext(), "Enable phone location", 0xffe6f4f8, TEAL);
         request.setOnClickListener(view -> actions.requestPermissions());
@@ -424,19 +460,31 @@ final class NativeDashboardView extends LinearLayout {
         LinearLayout inputRow = new LinearLayout(getContext());
         inputRow.setGravity(Gravity.CENTER_VERTICAL);
         EditText input = new EditText(getContext());
+        chatInput = input;
         input.setSingleLine(true);
         input.setHint("Ask about your sensor data…");
         input.setTextSize(14);
         input.setTextColor(INK);
         input.setHintTextColor(MUTED);
+        if (!pendingVoiceText.isEmpty()) {
+            input.setText(pendingVoiceText);
+            input.setSelection(input.length());
+            pendingVoiceText = "";
+        }
         input.setFilters(new InputFilter[]{new InputFilter.LengthFilter(2000)});
         input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
         input.setImeOptions(EditorInfo.IME_ACTION_SEND);
         input.setBackground(rounded(0xffffead0, BORDER, 22));
         input.setPadding(dp(15), 0, dp(15), 0);
         inputRow.addView(input, new LayoutParams(0, dp(48), 1));
+        Button mic = button(getContext(), "Mic", SURFACE, TEAL);
+        mic.setContentDescription("Speak a question about sensor data");
+        mic.setOnClickListener(view -> actions.openVoiceInput());
+        LayoutParams micParams = new LayoutParams(dp(52), dp(46));
+        micParams.leftMargin = dp(6);
+        inputRow.addView(mic, micParams);
         Button send = button(getContext(), loadingChat ? "…" : "Send", TEAL, 0xffffffff);
-        LinearLayout.LayoutParams sendParams = new LayoutParams(dp(76), dp(46));
+        LinearLayout.LayoutParams sendParams = new LayoutParams(dp(64), dp(46));
         sendParams.leftMargin = dp(8);
         inputRow.addView(send, sendParams);
         Runnable submit = () -> {
@@ -682,8 +730,9 @@ final class NativeDashboardView extends LinearLayout {
         content.addView(text("Tools and app settings", 14, MUTED, false));
         space(content, 12);
         addActionCard("Slope illustration", "Conceptual profile, not surveyed 3D terrain", TEAL, () -> showScreen("twin"));
-        addActionCard("Map and coordinates", "Open the saved GPS fix in a map app", 0xff2879a5, () -> showScreen("map"));
+        addActionCard("Map and coordinates", "Phone GPS fallback · Google Earth 3D satellite", 0xff2879a5, () -> showScreen("map"));
         addActionCard("Risk alerts", "Review recent sensor risk events", RED, () -> showScreen("alerts"));
+        addActionCard("Medical history", "Private medical card and nearby emergency-service search", RED, () -> showScreen("medical"));
         addActionCard("Reports and exports", "AI history analysis, downloadable PDF and CSV", GREEN, () -> showScreen("reports"));
         addActionCard("Settings and permissions", "Gemini, WhatsApp, location, notifications", 0xff6d55a5, () -> showScreen("settings"));
     }
@@ -728,7 +777,7 @@ final class NativeDashboardView extends LinearLayout {
         content.addView(keyCard);
         LinearLayout permissions = card();
         permissions.addView(text("Android permissions", 16, INK, true));
-        permissions.addView(text("Location is used for coordinates. Notifications show risk alerts. SOS sends a WhatsApp alert and an SMS to the same configured recipient. Android requires SMS permission; carrier charges may apply.", 13, MUTED, false));
+        permissions.addView(text("Location lets the app use ESP32 GPS or fall back to the phone's GPS/network fix. Microphone access enables voice questions to Gemini; speech recognition is provided by Android. Notifications show risk alerts. SMS permission is requested only when you send an SOS.", 13, MUTED, false));
         Button grant = button(getContext(), "Review permissions", 0xffe8f4f3, TEAL);
         addButton(permissions, grant);
         grant.setOnClickListener(view -> actions.requestPermissions());
@@ -752,16 +801,49 @@ final class NativeDashboardView extends LinearLayout {
         TextView pin = text("⌖", 52, TEAL, true);
         pin.setGravity(Gravity.CENTER);
         map.addView(pin);
-        map.addView(text(gpsLocationText(), 14, INK, true));
+        addGpsSourceLabel(map);
         addLocationLabel(map);
         content.addView(map);
-        Button open = button(getContext(), "Open coordinates in Maps", TEAL, 0xffffffff);
-        open.setOnClickListener(view -> actions.openMap(latitude(), longitude()));
-        addButton(content, open);
+        content.addView(text("Live phone GPS is used when the ESP32 has no satellite fix. Google Earth opens an external 3D satellite view of the latest coordinates and requires internet.", 12, MUTED, false));
+        Button earth = button(getContext(), "Open Google Earth 3D satellite", TEAL, 0xffffffff);
+        earth.setOnClickListener(view -> actions.openEarth(latitude(), longitude()));
+        addButton(content, earth);
+        Button satellite = button(getContext(), "Open satellite map", 0xffe6f4f8, TEAL);
+        satellite.setOnClickListener(view -> actions.openMap(latitude(), longitude()));
+        addButton(content, satellite);
         section("Location permissions");
         Button request = button(getContext(), "Enable phone location", 0xffe8f4f3, TEAL);
         request.setOnClickListener(view -> actions.requestPermissions());
         addButton(content, request);
+    }
+
+    private void renderMedicalHistory() {
+        content.removeAllViews();
+        content.addView(text("Medical history", 25, INK, true));
+        content.addView(text("A private emergency medical card stored on this device.", 14, MUTED, false));
+        space(content, 14);
+        LinearLayout medical = card();
+        medical.addView(text(medicalSummary, 14, INK, false));
+        content.addView(medical);
+        TextView sharing = text(shareMedicalWithSos
+                ? "Medical details are opted in for SOS messages to your configured contact."
+                : "Medical details are private and will not be included in SOS unless you opt in.",
+                12, shareMedicalWithSos ? AMBER : MUTED, true);
+        content.addView(sharing);
+        Button edit = button(getContext(), "Edit medical history", TEAL, 0xffffffff);
+        edit.setOnClickListener(view -> actions.editMedicalHistory());
+        addButton(content, edit);
+        content.addView(text("Find nearby services", 17, INK, true));
+        content.addView(text("These buttons open a map search. The app cannot identify or automatically message nearby hospitals or police without a verified emergency-service directory.", 12, MUTED, false));
+        Button hospitals = button(getContext(), "Find nearby hospitals", 0xffe6f4f8, TEAL);
+        hospitals.setOnClickListener(view ->
+                actions.openNearbyFacilities("hospitals", latitude(), longitude()));
+        addButton(content, hospitals);
+        Button police = button(getContext(), "Find nearby police stations", 0xffe6f4f8, TEAL);
+        police.setOnClickListener(view ->
+                actions.openNearbyFacilities("police stations", latitude(), longitude()));
+        addButton(content, police);
+        content.addView(text("SOS goes only to the phone number configured in Settings. SMS requires Android permission; WhatsApp click-to-chat still needs you to tap Send unless an approved WhatsApp Business API is configured.", 12, MUTED, false));
     }
 
     private void renderTwin() {
@@ -908,6 +990,11 @@ final class NativeDashboardView extends LinearLayout {
         parent.addView(visibleLocationLabel);
     }
 
+    private void addGpsSourceLabel(LinearLayout parent) {
+        visibleGpsSourceLabel = text(gpsLocationText(), 13, INK, false);
+        parent.addView(visibleGpsSourceLabel);
+    }
+
     private void addButton(LinearLayout parent, Button button) {
         LayoutParams params = new LayoutParams(LayoutParams.MATCH_PARENT, dp(48));
         params.topMargin = dp(12);
@@ -972,10 +1059,21 @@ final class NativeDashboardView extends LinearLayout {
         if (telemetryAvailable && row.optJSONObject("sensor_status") != null
                 && row.optJSONObject("sensor_status").optBoolean("gps", false)
                 && row.optInt("satellites", 0) > 0) {
-            return String.format(Locale.US, "ESP32 fix  %.5f, %.5f",
+            return String.format(Locale.US, "ESP32 satellite fix  %.5f, %.5f",
                     row.optDouble("latitude"), row.optDouble("longitude"));
         }
-        return "No confirmed ESP32 GPS fix";
+        if (hasRecentPhoneLocation()) {
+            return String.format(Locale.US, "Phone GPS fallback · ESP32 fix unavailable  %.5f, %.5f",
+                    phoneLatitude, phoneLongitude);
+        }
+        return "Waiting for a phone or ESP32 satellite fix";
+    }
+
+    private boolean hasRecentPhoneLocation() {
+        long ageNanos = SystemClock.elapsedRealtimeNanos() - phoneLocationElapsedNanos;
+        return Double.isFinite(phoneLatitude) && Double.isFinite(phoneLongitude)
+                && phoneLocationElapsedNanos > 0 && ageNanos >= 0
+                && ageNanos <= 2L * 60L * 1_000_000_000L;
     }
 
     private String sensorValue(String key, String sensor, String unit, int decimals) {
@@ -1014,14 +1112,14 @@ final class NativeDashboardView extends LinearLayout {
         JSONObject status = latest.optJSONObject("sensor_status");
         if (status != null && status.optBoolean("gps", false) && latest.optInt("satellites", 0) > 0)
             return latest.optDouble("latitude", Double.NaN);
-        return Double.NaN;
+        return hasRecentPhoneLocation() ? phoneLatitude : Double.NaN;
     }
 
     private double longitude() {
         JSONObject status = latest.optJSONObject("sensor_status");
         if (status != null && status.optBoolean("gps", false) && latest.optInt("satellites", 0) > 0)
             return latest.optDouble("longitude", Double.NaN);
-        return Double.NaN;
+        return hasRecentPhoneLocation() ? phoneLongitude : Double.NaN;
     }
 
     private int riskColor(String level) {
