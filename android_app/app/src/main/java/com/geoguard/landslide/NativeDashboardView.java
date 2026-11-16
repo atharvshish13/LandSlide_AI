@@ -8,6 +8,7 @@ import android.graphics.Path;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.SystemClock;
+import android.location.Location;
 import android.text.InputType;
 import android.text.InputFilter;
 import android.view.Gravity;
@@ -30,6 +31,7 @@ import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
 import java.util.Deque;
 import java.util.List;
@@ -45,9 +47,17 @@ final class NativeDashboardView extends LinearLayout {
         void openMap(double latitude, double longitude);
         void openEarth(double latitude, double longitude);
         void openNearbyFacilities(String facility, double latitude, double longitude);
+        void searchNearbyFacilities(String facility, double latitude, double longitude,
+                                     NearbyFacilitiesCallback callback);
+        void openFacilityOnMap(double latitude, double longitude, String name);
+        void callFacility(String phone);
         void savePdf(String report);
         void saveCsv(String csv);
         void sendGemini(JSONObject request, ResultCallback callback);
+    }
+
+    interface NearbyFacilitiesCallback {
+        void onResult(JSONArray facilities, String error);
     }
 
     interface ResultCallback {
@@ -64,7 +74,7 @@ final class NativeDashboardView extends LinearLayout {
     private static final int GREEN = 0xff198754;
     private static final int AMBER = 0xffd18a16;
     private static final int RED = 0xffc33c37;
-    private static final String[] TAB_IDS = {"home", "sensors", "ai", "reports", "more"};
+    private static final String[] TAB_IDS = {"home", "medical", "sensors", "ai", "reports", "more"};
     private final Actions actions;
     private final LinearLayout content;
     private final LinearLayout navigation;
@@ -74,6 +84,7 @@ final class NativeDashboardView extends LinearLayout {
     private final List<TextView> tabIcons = new ArrayList<>();
     private final List<TextView> tabLabels = new ArrayList<>();
     private final List<ChatMessage> chatMessages = new ArrayList<>();
+    private final List<ChatMessage> safetyMessages = new ArrayList<>();
     private final Deque<String> screenBackStack = new ArrayDeque<>();
     private JSONObject latest = new JSONObject();
     private JSONArray history = new JSONArray();
@@ -85,6 +96,7 @@ final class NativeDashboardView extends LinearLayout {
     private TextView visibleGpsSourceLabel;
     private LiveMapView liveMapView;
     private EditText chatInput;
+    private EditText safetyInput;
     private String pendingVoiceText = "";
     private String medicalSummary = "No medical history saved.";
     private boolean shareMedicalWithSos;
@@ -99,6 +111,10 @@ final class NativeDashboardView extends LinearLayout {
     private boolean reportAnalysisLoading;
     private String reportAnalysis = "";
     private String reportAnalysisError = "";
+    private JSONArray nearbyFacilities = new JSONArray();
+    private String nearbyFacilityType = "";
+    private String nearbyFacilityError = "";
+    private boolean nearbyFacilitiesLoading;
     NativeDashboardView(Context context, Actions actions) {
         super(context);
         this.actions = actions;
@@ -251,6 +267,7 @@ final class NativeDashboardView extends LinearLayout {
         switch (target) {
             case "sensors": renderSensors(); break;
             case "ai": renderChat(); break;
+            case "safety": renderSafetyGuide(); break;
             case "reports": renderReports(); break;
             case "alerts": renderAlerts(); break;
             case "twin": renderTwin(); break;
@@ -265,8 +282,8 @@ final class NativeDashboardView extends LinearLayout {
 
     private void buildNavigation() {
         String[] ids = TAB_IDS;
-        String[] labels = {"Dashboard", "Sensors", "Assistant", "Reports", "More"};
-        String[] icons = {"▦", "◉", "✦", "▤", "•••"};
+        String[] labels = {"Dashboard", "Medical", "Sensors", "AI", "Reports", "More"};
+        String[] icons = {"▦", "✚", "◉", "✦", "▤", "•••"};
         navigation.removeAllViews();
         tabItems.clear();
         tabIcons.clear();
@@ -284,7 +301,7 @@ final class NativeDashboardView extends LinearLayout {
             TextView icon = text(icons[i], 24, MUTED, true);
             icon.setGravity(Gravity.CENTER);
             item.addView(icon, new LayoutParams(LayoutParams.MATCH_PARENT, dp(34)));
-            TextView label = text(labels[i], 12, MUTED, true);
+            TextView label = text(labels[i], 10, MUTED, true);
             label.setGravity(Gravity.CENTER);
             item.addView(label);
             item.setOnClickListener(view -> navigateTab(id));
@@ -313,7 +330,9 @@ final class NativeDashboardView extends LinearLayout {
     private String bottomTabFor(String target) {
         switch (target) {
             case "sensors": return "sensors";
+            case "medical": return "medical";
             case "ai": return "ai";
+            case "safety": return "ai";
             case "reports": return "reports";
             case "home": return "home";
             default: return "more";
@@ -433,9 +452,13 @@ final class NativeDashboardView extends LinearLayout {
 
     private void renderChat() {
         content.removeAllViews();
-        content.addView(text("Gemini AI", 25, INK, true));
+        content.addView(text("AI assistants", 25, INK, true));
         content.addView(text("Ask about the readings or recent trends.", 14, MUTED, false));
         space(content, 14);
+        Button safety = button(getContext(), "Open offline safety assistant", 0xffe6f4f8, TEAL);
+        safety.setOnClickListener(view -> showScreen("safety"));
+        addButton(content, safety);
+        content.addView(text("Gemini AI", 17, INK, true));
         LinearLayout notice = card();
         notice.addView(text("AI guidance is informational, not an official warning. Follow local authorities during an emergency.", 12, MUTED, false));
         content.addView(notice);
@@ -542,6 +565,97 @@ final class NativeDashboardView extends LinearLayout {
             chatMessages.add(new ChatMessage(false, "Could not prepare the analysis request."));
             renderChat();
         }
+    }
+
+    private void renderSafetyGuide() {
+        content.removeAllViews();
+        content.addView(text("Offline safety assistant", 25, INK, true));
+        content.addView(text("On-device safety guidance · no API key or internet required.", 14, MUTED, false));
+        space(content, 12);
+        LinearLayout notice = card();
+        notice.addView(text("This assistant uses local rules, not a generative AI model. It is not a geotechnical assessment, medical advice, or an official warning. In immediate danger, move away from the slope and contact local emergency services.", 13, INK, false));
+        content.addView(notice);
+        LinearLayout thread = new LinearLayout(getContext());
+        thread.setOrientation(VERTICAL);
+        thread.setPadding(0, dp(8), 0, dp(8));
+        if (safetyMessages.isEmpty()) {
+            addChatBubble(thread, new ChatMessage(false,
+                    "Ask about immediate safety, warning signs, SOS, or how to interpret the app's current status."));
+        } else {
+            for (ChatMessage message : safetyMessages) addChatBubble(thread, message);
+        }
+        content.addView(thread);
+        LinearLayout inputRow = new LinearLayout(getContext());
+        inputRow.setGravity(Gravity.CENTER_VERTICAL);
+        safetyInput = new EditText(getContext());
+        safetyInput.setSingleLine(true);
+        safetyInput.setHint("Ask a safety question");
+        safetyInput.setTextSize(14);
+        safetyInput.setFilters(new InputFilter[]{new InputFilter.LengthFilter(500)});
+        safetyInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        safetyInput.setImeOptions(EditorInfo.IME_ACTION_SEND);
+        safetyInput.setBackground(rounded(0xffffead0, BORDER, 22));
+        safetyInput.setPadding(dp(15), 0, dp(15), 0);
+        inputRow.addView(safetyInput, new LayoutParams(0, dp(48), 1));
+        Button send = button(getContext(), "Ask", TEAL, 0xffffffff);
+        LayoutParams sendParams = new LayoutParams(dp(72), dp(46));
+        sendParams.leftMargin = dp(8);
+        inputRow.addView(send, sendParams);
+        Runnable submit = () -> {
+            String question = safetyInput.getText().toString().trim();
+            if (question.isEmpty()) return;
+            safetyMessages.add(new ChatMessage(true, question));
+            safetyMessages.add(new ChatMessage(false, answerSafetyQuestion(question)));
+            if (safetyMessages.size() > 30) {
+                safetyMessages.subList(0, safetyMessages.size() - 30).clear();
+            }
+            renderSafetyGuide();
+        };
+        send.setOnClickListener(view -> submit.run());
+        safetyInput.setOnEditorActionListener((view, actionId, event) -> {
+            if (actionId == EditorInfo.IME_ACTION_SEND) {
+                submit.run();
+                return true;
+            }
+            return false;
+        });
+        content.addView(inputRow);
+        Button gemini = button(getContext(), "Open Gemini assistant", SURFACE, INK);
+        gemini.setOnClickListener(view -> showScreen("ai"));
+        addButton(content, gemini);
+    }
+
+    private String answerSafetyQuestion(String question) {
+        String normalized = question.toLowerCase(Locale.ROOT);
+        String currentRisk = risk();
+        String status = demo ? "The app is showing simulated demo data."
+                : stale ? "The sensor data is stale; do not rely on its displayed risk as current."
+                : telemetryAvailable ? "The connected sensor currently reports " + currentRisk + " risk."
+                : "No fresh sensor reading is available.";
+
+        if (containsAny(normalized, "medical", "injury", "hurt", "bleeding", "health")) {
+            return "I cannot assess or treat a medical condition. For an injury or urgent health concern, contact local emergency services or a qualified clinician. Your medical card is stored on this device; it is included in SOS only if you opted in. " + status;
+        }
+        if (containsAny(normalized, "sos", "emergency", "help")) {
+            return "If anyone is in immediate danger, move away from the slope to a safer area and contact local emergency services now. The app's SOS button can submit an SMS after permission and open the configured WhatsApp route, but delivery is not guaranteed. " + status;
+        }
+        if (containsAny(normalized, "crack", "tilt", "movement", "landslide", "rain", "warning sign", "slope")) {
+            return "Watch for new or widening ground cracks, leaning trees or poles, unusual water seepage, falling rocks, or sudden ground movement. Move away from the slope and report signs to local authorities; do not approach to inspect. " + status + " Follow official evacuation instructions and do not wait for an app alert.";
+        }
+        if (containsAny(normalized, "risk", "sensor", "reading", "status", "data")) {
+            return status + " Risk screening is based only on the sensors currently confirmed by the app; missing, stale, or demo readings cannot establish that an area is safe. Follow local emergency authorities.";
+        }
+        if (containsAny(normalized, "safe", "evacuate", "leave", "stay")) {
+            return "I cannot determine that a location is safe. If authorities issue an evacuation instruction, follow it promptly. If you observe immediate danger, move away from the slope and contact local emergency services. " + status;
+        }
+        return "I can offer basic landslide safety guidance, but I cannot predict an event or confirm a place is safe. Keep away from unstable slopes, watch for new cracks, unusual seepage, falling rocks, or ground movement, and follow official local alerts. For immediate danger, contact local emergency services.";
+    }
+
+    private boolean containsAny(String text, String... terms) {
+        for (String term : terms) {
+            if (text.contains(term)) return true;
+        }
+        return false;
     }
 
     private JSONObject buildTelemetryContext() throws JSONException {
@@ -899,16 +1013,113 @@ final class NativeDashboardView extends LinearLayout {
         download.setOnClickListener(view -> actions.savePdf(buildMedicalReport()));
         addButton(content, download);
         content.addView(text("Find nearby services", 17, INK, true));
-        content.addView(text("These buttons open a map search. The app cannot identify or automatically message nearby hospitals or police without a verified emergency-service directory.", 12, MUTED, false));
-        Button hospitals = button(getContext(), "Find nearby hospitals", 0xffe6f4f8, TEAL);
-        hospitals.setOnClickListener(view ->
-                actions.openNearbyFacilities("hospitals", latitude(), longitude()));
+        content.addView(text("Search OpenStreetMap for nearby locations within 10 km. Listings and phone numbers depend on volunteer-provided map data; verify details before relying on them. Your coordinates are sent to the public Overpass map service when you search. Data © OpenStreetMap contributors.", 12, MUTED, false));
+        Button hospitals = button(getContext(), "List nearby hospitals", 0xffe6f4f8, TEAL);
+        hospitals.setOnClickListener(view -> searchNearbyFacilities("hospital"));
         addButton(content, hospitals);
-        Button police = button(getContext(), "Find nearby police stations", 0xffe6f4f8, TEAL);
-        police.setOnClickListener(view ->
-                actions.openNearbyFacilities("police stations", latitude(), longitude()));
+        Button police = button(getContext(), "List nearby police stations", 0xffe6f4f8, TEAL);
+        police.setOnClickListener(view -> searchNearbyFacilities("police"));
         addButton(content, police);
+        if (nearbyFacilitiesLoading) {
+            content.addView(text("Searching nearby map listings…", 13, MUTED, false));
+        } else if (!nearbyFacilityError.isEmpty()) {
+            content.addView(text(nearbyFacilityError, 13, RED, false));
+        } else if (!nearbyFacilityType.isEmpty()) {
+            String title = "hospital".equals(nearbyFacilityType) ? "Nearby medical facilities" : "Nearby police stations";
+            content.addView(text(title, 17, INK, true));
+            if (nearbyFacilities.length() == 0) {
+                content.addView(text("No matching listings were found within 10 km. Try again later or use the map search.", 13, MUTED, false));
+            } else {
+                List<JSONObject> sorted = new ArrayList<>();
+                for (int i = 0; i < nearbyFacilities.length(); i++) {
+                    JSONObject facility = nearbyFacilities.optJSONObject(i);
+                    if (facility != null) sorted.add(facility);
+                }
+                double originLat = latitude(), originLon = longitude();
+                Collections.sort(sorted, (first, second) ->
+                        Double.compare(facilityDistance(first, originLat, originLon),
+                                facilityDistance(second, originLat, originLon)));
+                for (int i = 0; i < Math.min(sorted.size(), 30); i++) {
+                    addNearbyFacility(sorted.get(i), originLat, originLon);
+                }
+                if (sorted.size() > 30) {
+                    content.addView(text("Showing the 30 closest available listings.", 12, MUTED, false));
+                }
+            }
+        }
         content.addView(text("SOS goes only to the phone number configured in Settings. SMS requires Android permission; WhatsApp click-to-chat still needs you to tap Send unless an approved WhatsApp Business API is configured.", 12, MUTED, false));
+    }
+
+    private void searchNearbyFacilities(String category) {
+        double lat = latitude(), lon = longitude();
+        if (!Double.isFinite(lat) || !Double.isFinite(lon)) {
+            Toast.makeText(getContext(), "Enable location or wait for an ESP32 GPS fix before searching.", Toast.LENGTH_LONG).show();
+            actions.requestPermissions();
+            return;
+        }
+        if (nearbyFacilitiesLoading) return;
+        nearbyFacilityType = category;
+        nearbyFacilityError = "";
+        nearbyFacilities = new JSONArray();
+        nearbyFacilitiesLoading = true;
+        renderMedicalHistory();
+        actions.searchNearbyFacilities(category, lat, lon, (results, error) -> post(() -> {
+            nearbyFacilitiesLoading = false;
+            nearbyFacilities = results == null ? new JSONArray() : results;
+            nearbyFacilityError = error == null ? "" : error;
+            if ("medical".equals(screen)) renderMedicalHistory();
+        }));
+    }
+
+    private void addNearbyFacility(JSONObject facility, double originLat, double originLon) {
+        JSONObject tags = facility.optJSONObject("tags");
+        if (tags == null) return;
+        JSONObject center = facility.optJSONObject("center");
+        double lat = facility.optDouble("lat", center == null ? Double.NaN : center.optDouble("lat", Double.NaN));
+        double lon = facility.optDouble("lon", center == null ? Double.NaN : center.optDouble("lon", Double.NaN));
+        if (!Double.isFinite(lat) || !Double.isFinite(lon)) return;
+        String name = tags.optString("name", "").trim();
+        if (name.isEmpty()) name = "Unnamed " + ("police".equals(tags.optString("amenity")) ? "police station" : "medical facility");
+        String phone = tags.optString("phone", "").trim();
+        if (phone.isEmpty()) phone = tags.optString("contact:phone", "").trim();
+        if (phone.isEmpty()) phone = tags.optString("contact:mobile", "").trim();
+        final String phoneNumber = phone;
+        boolean dialable = phoneNumber.matches("[+0-9() .-]{3,40}");
+        double distance = facilityDistance(facility, originLat, originLon);
+
+        LinearLayout item = card();
+        item.addView(text(name, 15, INK, true));
+        item.addView(text(String.format(Locale.US, "%.1f km away · %.5f, %.5f",
+                distance / 1000.0, lat, lon), 12, MUTED, false));
+        item.addView(text(phoneNumber.isEmpty() ? "Phone: not listed in OpenStreetMap"
+                : "Phone: " + phoneNumber, 13, phoneNumber.isEmpty() ? MUTED : TEAL, false));
+        LinearLayout actionsRow = new LinearLayout(getContext());
+        actionsRow.setGravity(Gravity.CENTER_VERTICAL);
+        Button mapButton = button(getContext(), "Open in Google Maps", 0xffe6f4f8, TEAL);
+        String facilityName = name;
+        mapButton.setOnClickListener(view -> actions.openFacilityOnMap(lat, lon, facilityName));
+        actionsRow.addView(mapButton, new LayoutParams(0, dp(44), dialable ? 2 : 1));
+        if (dialable) {
+            Button call = button(getContext(), "Call", TEAL, 0xffffffff);
+            call.setOnClickListener(view -> actions.callFacility(phoneNumber));
+            LayoutParams callParams = new LayoutParams(0, dp(44), 1);
+            callParams.leftMargin = dp(6);
+            actionsRow.addView(call, callParams);
+        }
+        LayoutParams rowParams = new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT);
+        rowParams.topMargin = dp(8);
+        item.addView(actionsRow, rowParams);
+        content.addView(item);
+    }
+
+    private double facilityDistance(JSONObject facility, double originLat, double originLon) {
+        JSONObject center = facility.optJSONObject("center");
+        double lat = facility.optDouble("lat", center == null ? Double.NaN : center.optDouble("lat", Double.NaN));
+        double lon = facility.optDouble("lon", center == null ? Double.NaN : center.optDouble("lon", Double.NaN));
+        if (!Double.isFinite(lat) || !Double.isFinite(lon)) return Double.POSITIVE_INFINITY;
+        float[] result = new float[1];
+        Location.distanceBetween(originLat, originLon, lat, lon, result);
+        return result[0];
     }
 
     private void renderTwin() {

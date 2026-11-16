@@ -55,6 +55,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.HttpURLConnection;
 import java.nio.charset.StandardCharsets;
 import java.text.DateFormat;
 import java.util.ArrayList;
@@ -356,6 +357,106 @@ public class MainActivity extends AppCompatActivity implements NativeDashboardVi
         } catch (android.content.ActivityNotFoundException error) {
             Toast.makeText(this, "Could not open a map search. Check that a browser or Maps app is installed.",
                     Toast.LENGTH_LONG).show();
+        }
+    }
+
+    @Override
+    public void searchNearbyFacilities(String facility, double latitude, double longitude,
+                                       NativeDashboardView.NearbyFacilitiesCallback callback) {
+        double[] coordinates = resolveCoordinates(latitude, longitude);
+        if (coordinates == null) {
+            callback.onResult(null, "A current GPS fix is needed to search nearby services.");
+            return;
+        }
+        boolean police = "police".equals(facility);
+        String amenityPattern = police ? "^police$" : "^(hospital|clinic|doctors)$";
+        String query = String.format(Locale.US,
+                "[out:json][timeout:20];nwr[\"amenity\"~\"%s\"](around:10000,%.6f,%.6f);out center tags;",
+                amenityPattern, coordinates[0], coordinates[1]);
+        io.execute(() -> {
+            HttpURLConnection connection = null;
+            try {
+                connection = (HttpURLConnection) new java.net.URL(
+                        "https://overpass-api.de/api/interpreter").openConnection();
+                connection.setRequestMethod("POST");
+                connection.setConnectTimeout(8000);
+                connection.setReadTimeout(25000);
+                connection.setRequestProperty("User-Agent",
+                        "DrishtiSetu/1.6 (+https://github.com/atharvshish13/LandSlide_AI)");
+                connection.setRequestProperty("Content-Type",
+                        "application/x-www-form-urlencoded; charset=UTF-8");
+                connection.setDoOutput(true);
+                String body = "data=" + java.net.URLEncoder.encode(query, StandardCharsets.UTF_8.name());
+                try (OutputStream output = connection.getOutputStream()) {
+                    output.write(body.getBytes(StandardCharsets.UTF_8));
+                }
+                int status = connection.getResponseCode();
+                InputStream stream = status >= 200 && status < 300
+                        ? connection.getInputStream() : connection.getErrorStream();
+                String responseBody = stream == null ? "" : readLimited(stream, 2 * 1024 * 1024);
+                if (status < 200 || status >= 300) {
+                    throw new IOException("Nearby map search returned HTTP " + status + ".");
+                }
+                JSONArray elements = new JSONObject(responseBody).optJSONArray("elements");
+                if (elements == null) throw new IOException("Nearby map search returned an invalid response.");
+                JSONArray results = new JSONArray();
+                for (int i = 0; i < elements.length(); i++) {
+                    JSONObject element = elements.optJSONObject(i);
+                    if (element != null) results.put(element);
+                }
+                runOnUiThread(() -> callback.onResult(results, null));
+            } catch (Exception error) {
+                android.util.Log.w("DrishtiSetu", "Nearby OpenStreetMap search failed.", error);
+                String message = "Nearby search failed: " + safeError(error)
+                        + " Check your internet connection and try again.";
+                runOnUiThread(() -> callback.onResult(null, message));
+            } finally {
+                if (connection != null) connection.disconnect();
+            }
+        });
+    }
+
+    @Override
+    public void openFacilityOnMap(double latitude, double longitude, String name) {
+        double[] coordinates = resolveCoordinates(latitude, longitude);
+        if (coordinates == null) return;
+        String query = Uri.encode(name + " " + String.format(Locale.US, "%.6f,%.6f",
+                coordinates[0], coordinates[1]));
+        Uri uri = Uri.parse("https://www.google.com/maps/search/?api=1&query=" + query);
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, uri));
+        } catch (android.content.ActivityNotFoundException error) {
+            Toast.makeText(this, "Could not open Google Maps or a browser.", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    @Override
+    public void callFacility(String phone) {
+        String number = phone == null ? "" : phone.trim();
+        if (!number.matches("[+0-9() .-]{3,40}")) {
+            Toast.makeText(this, "This map listing does not contain a valid phone number.",
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+        try {
+            startActivity(new Intent(Intent.ACTION_DIAL, Uri.fromParts("tel", number, null)));
+        } catch (android.content.ActivityNotFoundException error) {
+            Toast.makeText(this, "No phone dialer is available on this device.",
+                    Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private String readLimited(InputStream input, int maxBytes) throws IOException {
+        try (InputStream stream = input; ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[4096];
+            int total = 0;
+            int length;
+            while ((length = stream.read(buffer)) != -1) {
+                total += length;
+                if (total > maxBytes) throw new IOException("Nearby map response was too large.");
+                output.write(buffer, 0, length);
+            }
+            return output.toString(StandardCharsets.UTF_8.name());
         }
     }
 
