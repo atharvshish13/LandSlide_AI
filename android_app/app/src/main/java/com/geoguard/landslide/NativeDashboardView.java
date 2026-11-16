@@ -83,12 +83,14 @@ final class NativeDashboardView extends LinearLayout {
     private String locationText = "Location not available";
     private TextView visibleLocationLabel;
     private TextView visibleGpsSourceLabel;
+    private LiveMapView liveMapView;
     private EditText chatInput;
     private String pendingVoiceText = "";
     private String medicalSummary = "No medical history saved.";
     private boolean shareMedicalWithSos;
     private double phoneLatitude = Double.NaN;
     private double phoneLongitude = Double.NaN;
+    private float phoneAccuracyMeters;
     private long phoneLocationElapsedNanos;
     private boolean telemetryAvailable;
     private boolean stale;
@@ -156,8 +158,10 @@ final class NativeDashboardView extends LinearLayout {
         stale = staleData;
         demo = simulated;
         updateConnection();
-        if ("map".equals(screen) && visibleGpsSourceLabel != null)
-            visibleGpsSourceLabel.setText(gpsLocationText());
+        if ("map".equals(screen)) {
+            if (visibleGpsSourceLabel != null) visibleGpsSourceLabel.setText(gpsLocationText());
+            updateLiveMapLocation();
+        }
         redrawCurrentDataScreen();
     }
 
@@ -186,11 +190,13 @@ final class NativeDashboardView extends LinearLayout {
                 && Math.abs(latitude) <= 90 && Math.abs(longitude) <= 180) {
             phoneLatitude = latitude;
             phoneLongitude = longitude;
+            phoneAccuracyMeters = accuracy;
             phoneLocationElapsedNanos = elapsedRealtimeNanos;
             locationText = String.format(Locale.US, "%.5f, %.5f  ·  ±%.0fm",
                     latitude, longitude, accuracy);
             if (visibleLocationLabel != null) visibleLocationLabel.setText(locationText);
             if (visibleGpsSourceLabel != null) visibleGpsSourceLabel.setText(gpsLocationText());
+            if ("map".equals(screen)) updateLiveMapLocation();
         }
     }
 
@@ -360,7 +366,7 @@ final class NativeDashboardView extends LinearLayout {
         addGpsSourceLabel(location);
         addLocationLabel(location);
         Button mapButton = button(getContext(), "Open map", 0xffe8f4f3, TEAL);
-        mapButton.setOnClickListener(view -> actions.openMap(latitude(), longitude()));
+        mapButton.setOnClickListener(view -> showScreen("map"));
         LinearLayout.LayoutParams mapParams = new LayoutParams(LayoutParams.WRAP_CONTENT, dp(42));
         mapParams.topMargin = dp(10);
         location.addView(mapButton, mapParams);
@@ -808,17 +814,42 @@ final class NativeDashboardView extends LinearLayout {
     private void renderMap() {
         content.removeAllViews();
         content.addView(text("Map and location", 25, INK, true));
-        content.addView(text("Coordinates are provided by the ESP32 GPS fix or phone location.", 14, MUTED, false));
+        content.addView(text("Live location on an in-app street map. Drag to explore, pinch or use zoom controls.", 14, MUTED, false));
         space(content, 14);
         LinearLayout map = card();
-        map.setGravity(Gravity.CENTER);
-        TextView pin = text("⌖", 52, TEAL, true);
-        pin.setGravity(Gravity.CENTER);
-        map.addView(pin);
-        addGpsSourceLabel(map);
-        addLocationLabel(map);
+        map.setPadding(dp(8), dp(8), dp(8), dp(8));
+        liveMapView = new LiveMapView(getContext());
+        map.addView(liveMapView, new LayoutParams(LayoutParams.MATCH_PARENT, dp(300)));
         content.addView(map);
-        content.addView(text("Live phone GPS is used when the ESP32 has no satellite fix. Google Earth opens an external 3D satellite view of the latest coordinates and requires internet.", 12, MUTED, false));
+        updateLiveMapLocation();
+        LinearLayout controls = new LinearLayout(getContext());
+        controls.setGravity(Gravity.CENTER);
+        Button center = button(getContext(), "My location", TEAL, 0xffffffff);
+        center.setOnClickListener(view -> {
+            if (!Double.isFinite(latitude()) || !Double.isFinite(longitude())) {
+                actions.requestPermissions();
+                return;
+            }
+            liveMapView.centerOnLocation();
+        });
+        controls.addView(center, new LayoutParams(0, dp(46), 2));
+        Button zoomIn = button(getContext(), "Zoom +", 0xffe6f4f8, TEAL);
+        zoomIn.setOnClickListener(view -> liveMapView.zoomIn());
+        LayoutParams zoomParams = new LayoutParams(0, dp(46), 1);
+        zoomParams.leftMargin = dp(6);
+        controls.addView(zoomIn, zoomParams);
+        Button zoomOut = button(getContext(), "Zoom -", 0xffe6f4f8, TEAL);
+        zoomOut.setOnClickListener(view -> liveMapView.zoomOut());
+        LayoutParams zoomOutParams = new LayoutParams(0, dp(46), 1);
+        zoomOutParams.leftMargin = dp(6);
+        controls.addView(zoomOut, zoomOutParams);
+        content.addView(controls);
+        Button retry = button(getContext(), "Retry map tiles", SURFACE, INK);
+        retry.setOnClickListener(view -> liveMapView.retryFailedTiles());
+        addButton(content, retry);
+        addGpsSourceLabel(content);
+        addLocationLabel(content);
+        content.addView(text("Map tiles © OpenStreetMap contributors; an internet connection is required. Location follows the ESP32 GPS fix when available, otherwise the phone GPS/network location. Satellite and Google Earth views open external apps.", 12, MUTED, false));
         Button earth = button(getContext(), "Open Google Earth 3D satellite", TEAL, 0xffffffff);
         earth.setOnClickListener(view -> actions.openEarth(latitude(), longitude()));
         addButton(content, earth);
@@ -829,6 +860,23 @@ final class NativeDashboardView extends LinearLayout {
         Button request = button(getContext(), "Enable phone location", 0xffe8f4f3, TEAL);
         request.setOnClickListener(view -> actions.requestPermissions());
         addButton(content, request);
+    }
+
+    private void updateLiveMapLocation() {
+        if (liveMapView == null) return;
+        double lat = latitude();
+        double lon = longitude();
+        if (!Double.isFinite(lat) || !Double.isFinite(lon)) {
+            liveMapView.clearLocation();
+            return;
+        }
+        float accuracy = phoneAccuracyMeters;
+        JSONObject status = latest.optJSONObject("sensor_status");
+        if (telemetryAvailable && status != null && status.optBoolean("gps", false)
+                && latest.optInt("satellites", 0) > 0) {
+            accuracy = (float) latest.optDouble("gps_accuracy", 0);
+        }
+        liveMapView.setLocation(lat, lon, accuracy);
     }
 
     private void renderMedicalHistory() {
